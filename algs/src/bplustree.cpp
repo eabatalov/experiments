@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <unordered_set>
 
 #define MB(mbs) ((mbs) << 20)
 
@@ -86,6 +87,168 @@ static void test_block_dev()
     delete[] block2;
 }
 
+#define BLOCKS_COUNT_FOR_DATA(data_bytes_size, block_size) \
+    (((data_bytes_size) + ((block_size) - 1)) / (block_size))
+#define DATA_BLOCK_IX(data_offset, block_size) \
+    ((data_offset) / (block_size))
+
+struct block_allocator
+{
+    block_allocator(block_dev_t &bdev, bool reset=true)
+        : bdev_(bdev)
+    {
+        assert(bdev.block_size() > sizeof(size_t));
+
+        char block[bdev.block_size()];
+        if (reset) {
+            // Reinitialize "Filesystem"
+            const size_t metadata_size_in_bytes =
+                // Block align metadata of fixed size
+                // for free list random access simplification
+                BLOCKS_COUNT_FOR_DATA(
+                    sizeof(free_blocks_count_), // length of free list
+                    bdev.block_size()
+                ) * bdev.block_size()
+                + bdev.blocks_count() * sizeof(size_t); // free list of blocks
+            const size_t metadata_size_in_blocks =
+                BLOCKS_COUNT_FOR_DATA(metadata_size_in_bytes, bdev.block_size());
+            const size_t user_blocks_count = bdev.blocks_count() - metadata_size_in_blocks;
+            const size_t free_list_last_block = metadata_size_in_blocks + user_blocks_count;
+            assert(metadata_size_in_blocks < bdev.blocks_count());
+
+            memset(block, 0, sizeof(block));
+            ((size_t*)block)[0] = user_blocks_count; // initial length of free list
+            bdev.write_block(0, block);
+
+            free_list_entry_t *block_it = (free_list_entry_t*)block;
+            free_list_entry_t * const block_end =
+                (free_list_entry_t*)(block + bdev.block_size());
+            size_t free_list_block_ix = 1;
+            free_list_entry_t free_block_ix = metadata_size_in_blocks;
+
+            while(free_block_ix != free_list_last_block)
+            {
+                // less because block_size() may not be sizeof(size_t) aligned
+                while((block_it < block_end) && (free_block_ix != free_list_last_block))
+                {
+                    *block_it = free_block_ix;
+                    ++block_it;
+                    ++free_block_ix;
+                }
+                bdev.write_block(free_list_block_ix, block);
+                block_it = (free_list_entry_t*)block;
+                free_list_block_ix++;
+            }
+        }
+
+        // Read "filesystem" state
+        bdev.read_block(0, block);
+        free_blocks_count_ = ((size_t*)block)[0];
+    }
+
+    size_t alloc_block()
+    {
+        char block[bdev_.block_size()];
+        free_list_entry_t *fle = (free_list_entry_t*)block;
+        set_free_blocks_count(free_blocks_count_ - 1, block);
+        const size_t allocated_block_free_list_ix = free_blocks_count_;
+        const size_t fle_block_ix = DATA_BLOCK_IX(
+            allocated_block_free_list_ix * sizeof(free_list_entry_t), bdev_.block_size()
+        );
+        bdev_.read_block(1 + fle_block_ix, block);
+        const size_t fle_ix =
+            allocated_block_free_list_ix % (bdev_.block_size() / sizeof(free_list_entry_t));
+        return fle[fle_ix];
+    }
+
+    void free_block(size_t block_ix)
+    {
+        char block[bdev_.block_size()];
+        free_list_entry_t *fle = (free_list_entry_t*)block;
+        const size_t freed_block_free_list_ix = free_blocks_count_;
+        const size_t fle_block_ix = DATA_BLOCK_IX(
+            freed_block_free_list_ix * sizeof(free_list_entry_t), bdev_.block_size()
+        );
+        const size_t fle_ix =
+            freed_block_free_list_ix % (bdev_.block_size() / sizeof(free_list_entry_t));
+        bdev_.read_block(1 + fle_block_ix, block);
+        fle[fle_ix] = block_ix;
+        bdev_.write_block(1 + fle_block_ix, block);
+        set_free_blocks_count(free_blocks_count_ + 1, block);
+    }
+
+    bool has_free_block()
+    {
+        return free_blocks_count_ > 0;
+    }
+
+private:
+    typedef size_t free_list_entry_t;
+    size_t free_blocks_count_;
+    block_dev_t &bdev_;
+
+    void set_free_blocks_count(size_t new_value, char* block_buf)
+    {
+        size_t *free_blocks_count_bd = (size_t*)block_buf;
+        free_blocks_count_ = new_value;
+        *free_blocks_count_bd = new_value;
+        bdev_.write_block(0, block_buf);
+    }
+};
+
+static void test_block_allocator()
+{
+    const size_t BLOCK_SIZE = 64;
+    const size_t BDEV_SIZE = MB(100ULL);
+    block_dev_t bdev(BDEV_SIZE / BLOCK_SIZE, BLOCK_SIZE);
+    block_allocator bdev_alloc(bdev, true);
+
+    std::unordered_set<size_t> allocated_blocks;
+    while(bdev_alloc.has_free_block())
+    {
+        size_t allocated_block = bdev_alloc.alloc_block();
+        bool inserted = allocated_blocks.insert(allocated_block).second;
+        assert(inserted);
+    }
+
+    // Now we'll deallocate blocks in some random order
+    for(size_t block : allocated_blocks)
+    {
+        bdev_alloc.free_block(block);
+    }
+    allocated_blocks.clear();
+
+    // And then we allocate all the blocks again from
+    // full but not newly created bdev allocator
+    while(bdev_alloc.has_free_block())
+    {
+        size_t allocated_block = bdev_alloc.alloc_block();
+        bool inserted = allocated_blocks.insert(allocated_block).second;
+        assert(inserted);
+    }
+
+    // Cool. Now we can check that block allocator
+    // restores its state form block dev
+    block_allocator bdev_alloc2(bdev, false);
+    assert(!bdev_alloc2.has_free_block());
+    std::unordered_set<size_t> free_blocks;
+    for(size_t i = 0; i < 3; ++i)
+    {
+        size_t freed_block = *allocated_blocks.begin();
+        allocated_blocks.erase(freed_block);
+        free_blocks.insert(freed_block);
+        bdev_alloc2.free_block(freed_block);
+    }
+
+    while(!free_blocks.empty())
+    {
+        size_t allocated_block = bdev_alloc2.alloc_block();
+        assert(free_blocks.find(allocated_block) != free_blocks.end());
+        free_blocks.erase(allocated_block);
+    }
+    assert(!bdev_alloc2.has_free_block());
+}
+
 template<class KEY, class VALUE>
 struct bplus_tree_t
 {
@@ -134,6 +297,7 @@ void test_bplus_tree()
 int main()
 {
     test_block_dev();
+    test_block_allocator();
     test_bplus_tree();
     return 0;
 }
