@@ -1,9 +1,19 @@
+#include <limits>
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <cstddef>
 #include <unordered_set>
 
+// Code is written with hackton quality
+// to quickly explore the main concepts
+// I am interested in
+
 #define MB(mbs) ((mbs) << 20)
+
+typedef size_t block_ix_t;
+static const block_ix_t INVALID_BLOCK_IX =
+    std::numeric_limits<block_ix_t>::max();
 
 struct block_dev_t
 {
@@ -37,6 +47,7 @@ struct block_dev_t
     {
         return blocks_cnt_;
     }
+
 private:
     char *data_;
     size_t block_size_;
@@ -199,7 +210,7 @@ private:
 static void test_block_allocator()
 {
     const size_t BLOCK_SIZE = 64;
-    const size_t BDEV_SIZE = MB(100ULL);
+    const size_t BDEV_SIZE = MB(5ULL);
     block_dev_t bdev(BDEV_SIZE / BLOCK_SIZE, BLOCK_SIZE);
     block_allocator bdev_alloc(bdev, true);
 
@@ -249,6 +260,233 @@ static void test_block_allocator()
     assert(!bdev_alloc2.has_free_block());
 }
 
+template<class KEY>
+struct bplus_tree_node_t
+{
+    bplus_tree_node_t(block_dev_t &bdev, block_ix_t node_block_ix, bool is_new=false)
+        : bdev_(bdev)
+        , block_ix_(node_block_ix)
+    {
+        node_block_ = (pod_bplus_tree_node_t*)new char[bdev_.block_size()];
+        if (is_new)
+        {
+            node_block_->is_leaf_ = false;
+            node_block_->parent_block_ix_ = INVALID_BLOCK_IX;
+            node_block_->keys_count_ = 0;
+            bdev_.write_block(block_ix_, (void*)node_block_);
+        } else
+        {
+            bdev_.read_block(block_ix_, (void*)node_block_);
+        }
+        assert(max_entries_count() >= 2);
+    }
+
+    bool get_is_leaf() const
+    {
+        return node_block_->is_leaf_;
+    }
+
+    void set_is_leaf(bool is_leaf)
+    {
+        node_block_->is_leaf_ = is_leaf;
+        bdev_.write_block(block_ix_, (void*)node_block_);
+    }
+
+    block_ix_t get_parent_block_ix() const
+    {
+        return node_block_->parent_block_ix_;
+    }
+
+    void set_parent_block_ix(block_ix_t parent_block_ix)
+    {
+        node_block_.parent_block_ix_ = parent_block_ix;
+        bdev_.write_block(block_ix_, (void*)node_block_);
+    }
+
+    block_ix_t get_next_inorder_block_ix()
+    {
+        assert(node_block_->is_leaf_);
+        return (entries_begin() + max_entries_count() - 1)->block_ix_;
+    }
+
+    void set_next_inorder_block_ix(block_ix_t block_ix)
+    {
+        assert(node_block_->is_leaf_);
+        (entries_begin() + max_entries_count() - 1)->block_ix_ = block_ix;
+        bdev_.write_block(block_ix_, (void*)node_block_);
+    }
+
+    unsigned short get_free_entries_count() const
+    {
+        return max_entries_count() - node_block_->keys_count_
+            - (node_block_->is_leaf_ ? 1 : 0);
+    }
+
+    block_ix_t get_key_block_ix(const KEY &key)
+    {
+        // As keys are sorted it can be implemented as binary search
+        for(block_ix_and_key_t *bixandk = entries_begin();
+                bixandk != entries_end(); ++bixandk)
+        {
+            if (key == bixandk->key_)
+                return bixandk->block_ix_;
+        }
+        return INVALID_BLOCK_IX;
+    }
+
+    bool add_entry(const KEY &key, block_ix_t block_ix)
+    {
+        assert(get_key_block_ix(key) == INVALID_BLOCK_IX);
+        if (get_free_entries_count() == 0)
+            return false;
+
+        size_t insert_ix = 0;
+        for(block_ix_and_key_t *bixandk = entries_begin();
+            bixandk != entries_end(); ++bixandk)
+        {
+            if (bixandk->key_ > key)
+            {
+                insert_ix = bixandk - entries_begin();
+                break;
+            }
+            ++insert_ix;
+        }
+        block_ix_and_key_t *inserted_bixandk =
+            entries_begin() + insert_ix;
+
+        memmove(
+            (void*)(inserted_bixandk + 1),
+            (void*)inserted_bixandk,
+            (entries_end() - inserted_bixandk) * sizeof(*inserted_bixandk)
+        );
+        inserted_bixandk->key_ = key;
+        inserted_bixandk->block_ix_ = block_ix;
+        set_keys_count(node_block_->keys_count_ + 1);
+        return true;
+    }
+
+    bool delete_entry(const KEY &key)
+    {
+        if (get_key_block_ix(key) == INVALID_BLOCK_IX)
+            return false;
+
+        block_ix_and_key_t *bixandk_to_delete = nullptr;
+        for(block_ix_and_key_t *bixandk = entries_begin();
+            bixandk != entries_end(); ++bixandk)
+        {
+            if (bixandk->key_ == key)
+            {
+                bixandk_to_delete = bixandk;
+                break;
+            }
+        }
+        memmove(
+            (void*)(bixandk_to_delete),
+            (void*)(bixandk_to_delete + 1),
+            (entries_end() - bixandk_to_delete - 1) * sizeof(*bixandk_to_delete)
+        );
+        set_keys_count(node_block_->keys_count_ - 1);
+        return true;
+    }
+
+    ~bplus_tree_node_t()
+    {
+        delete[] node_block_;
+    }
+
+private:
+    struct pod_bplus_tree_node_t;
+    block_dev_t &bdev_;
+    pod_bplus_tree_node_t *node_block_;
+    block_ix_t block_ix_;
+
+    struct block_ix_and_key_t
+    {
+        KEY key_;
+        block_ix_t block_ix_;
+    };
+
+    struct pod_bplus_tree_node_t
+    {
+        bool is_leaf_;
+        block_ix_t parent_block_ix_;
+        unsigned short keys_count_;
+        block_ix_and_key_t bixandk_[];
+    };
+
+    block_ix_and_key_t* entries_begin()
+    {
+        return (block_ix_and_key_t*)node_block_->bixandk_;
+    }
+
+    block_ix_and_key_t* entries_end()
+    {
+        return ((block_ix_and_key_t*)node_block_->bixandk_) + node_block_->keys_count_;
+    }
+
+    size_t max_entries_count() const
+    {
+        const size_t header_size =
+            offsetof(pod_bplus_tree_node_t, bixandk_);
+        return (bdev_.block_size() - header_size)
+            / sizeof(block_ix_and_key_t);
+    }
+
+    void set_keys_count(unsigned short new_keys_count)
+    {
+        node_block_->keys_count_ = new_keys_count;
+        bdev_.write_block(block_ix_, (void*)node_block_);
+    }
+};
+
+void test_bplus_tree_node()
+{
+    typedef unsigned short key_t;
+    const size_t BLOCK_SIZE = 256;
+    const size_t BDEV_SIZE = MB(1ULL);
+    block_dev_t bdev(BDEV_SIZE / BLOCK_SIZE, BLOCK_SIZE);
+    bplus_tree_node_t<key_t> node(bdev, 0, true);
+    node.set_is_leaf(true);
+    node.set_next_inorder_block_ix(777);
+
+    const size_t node_capacity = node.get_free_entries_count();
+    std::unordered_set<key_t> test_keys;
+    for(key_t i = 0; i < node_capacity; ++i)
+    {
+        test_keys.insert(i);
+    }
+    // pseudo random order
+    for(key_t key : test_keys)
+    {
+        assert(node.add_entry(key, key));
+    }
+    assert(node.get_free_entries_count() == 0);
+
+    for(key_t key : test_keys)
+    {
+        assert(node.get_key_block_ix(key) == key);
+    }
+
+    // test node state persistancy
+    bplus_tree_node_t<unsigned short> node1(bdev, 0, false);
+    assert(node.get_key_block_ix(*test_keys.begin()) ==
+        node1.get_key_block_ix(*test_keys.begin()));
+    assert(node.get_parent_block_ix() == node1.get_parent_block_ix());
+    assert(node.get_free_entries_count() == node1.get_free_entries_count());
+    assert(node.get_is_leaf() == node1.get_is_leaf());
+    assert(node.get_next_inorder_block_ix() == node1.get_next_inorder_block_ix());
+
+    // check remove
+    size_t free_entries_count = node.get_free_entries_count();
+    for(key_t key : test_keys)
+    {
+        assert(node.delete_entry(key));
+        free_entries_count++;
+        assert(node.get_free_entries_count() == free_entries_count);
+    }
+    assert(node.get_next_inorder_block_ix() == 777);
+}
+
 template<class KEY, class VALUE>
 struct bplus_tree_t
 {
@@ -280,7 +518,7 @@ private:
 void test_bplus_tree()
 {
     const size_t BLOCK_SIZE = 512; // 512 bytes block
-    block_dev_t bdev(MB(100ULL) / BLOCK_SIZE, BLOCK_SIZE);
+    block_dev_t bdev(MB(2ULL) / BLOCK_SIZE, BLOCK_SIZE);
 
     typedef std::pair<int, int> key_t;
     struct value_t
@@ -298,6 +536,7 @@ int main()
 {
     test_block_dev();
     test_block_allocator();
+    test_bplus_tree_node();
     test_bplus_tree();
     return 0;
 }
